@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mini-vllm"
+version = "0.1.0"
+description = "A teaching-first LLM inference engine built with PyTorch"
+requires-python = ">=3.11"
+dependencies = [
+    "huggingface-hub>=0.30",
+    "safetensors>=0.5",
+    "torch>=2.4",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.2",
+    "transformers>=4.51,<5",
+]
+
+[tool.setuptools.packages.find]
+include = ["engine*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "cuda: requires a CUDA-capable GPU",
+    "benchmark: performance measurement run through a versioned harness",
+    "model: downloads and runs the full Qwen3-0.6B-Base checkpoint",
+]
+
