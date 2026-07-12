@@ -7,8 +7,9 @@ import pytest
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+from engine.cache import PagedKVCache
 from engine.config import CANONICAL_MODEL_ID, CANONICAL_MODEL_REVISION
-from engine.generation import greedy_decode
+from engine.generation import greedy_decode, paged_greedy_decode
 from engine.model.loader import load_model, resolve_checkpoint
 from engine.model.qwen3 import first_hidden_state_difference
 
@@ -101,6 +102,7 @@ def _run_full_parity(device: torch.device, dtype: torch.dtype) -> None:
         revision=CANONICAL_MODEL_REVISION,
         device=str(device),
         dtype=mini_dtype,
+        num_kv_blocks=8,
     )
     assert report.consumed
     assert model.model.embed_tokens.weight.data_ptr() == model.lm_head.weight.data_ptr()
@@ -114,16 +116,39 @@ def _run_full_parity(device: torch.device, dtype: torch.dtype) -> None:
         ).cpu()
         for input_ids in tokenized
     ]
-    for fixture, expected, actual in zip(PROMPTS, expected_tokens, actual_tokens, strict=True):
-        assert expected.shape == actual.shape, fixture.category
+    cache = PagedKVCache(model.config)
+    cached_tokens = [
+        paged_greedy_decode(
+            model,
+            input_ids,
+            cache=cache,
+            max_new_tokens=MAX_NEW_TOKENS,
+            eos_token_id=tokenizer.eos_token_id,
+            sequence_ids=[fixture.category],
+        ).cpu()
+        for fixture, input_ids in zip(PROMPTS, tokenized, strict=True)
+    ]
+    cache.assert_no_leaks()
+
+    for fixture, expected, dense, cached in zip(
+        PROMPTS, expected_tokens, actual_tokens, cached_tokens, strict=True
+    ):
+        assert expected.shape == dense.shape == cached.shape, fixture.category
         # Comparing every column makes the first divergent decode step visible.
         for step in range(expected.shape[1]):
             torch.testing.assert_close(
-                actual[:, step],
+                dense[:, step],
                 expected[:, step],
                 rtol=0.0,
                 atol=0.0,
-                msg=f"{fixture.category} diverged at token column {step}",
+                msg=f"dense {fixture.category} diverged at token column {step}",
+            )
+            torch.testing.assert_close(
+                cached[:, step],
+                expected[:, step],
+                rtol=0.0,
+                atol=0.0,
+                msg=f"paged {fixture.category} diverged at token column {step}",
             )
 
     actual_output = model(tokenized[0], output_hidden_states=True)

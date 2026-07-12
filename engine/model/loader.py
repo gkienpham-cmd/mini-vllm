@@ -141,6 +141,8 @@ def load_model(
     cache_dir: str | Path | None = None,
     device: str = "cpu",
     dtype: str = "float32",
+    kv_block_size: int = 16,
+    num_kv_blocks: int = 0,
     require_canonical: bool = True,
 ) -> tuple[Qwen3ForCausalLM, WeightLoadReport, Path]:
     resolved_revision = revision
@@ -158,6 +160,8 @@ def load_model(
         revision=resolved_revision,
         device=device,
         dtype=dtype,
+        kv_block_size=kv_block_size,
+        num_kv_blocks=num_kv_blocks,
         require_canonical=require_canonical,
     )
 

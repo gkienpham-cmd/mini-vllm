@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 import torch
 from transformers import Qwen3Config
 from transformers.models.qwen3.modeling_qwen3 import (
@@ -18,6 +20,7 @@ from engine.model.qwen3 import (
     Qwen3RotaryEmbedding,
     first_hidden_state_difference,
 )
+from engine.cache import PagedKVCache
 
 CPU_RTOL = 1e-5
 CPU_ATOL = 1e-6
@@ -141,6 +144,38 @@ def test_tiny_full_model_and_layer_boundaries_match_hugging_face(tiny_config) ->
     assert difference is None
 
 
+def test_paged_prefill_and_decode_match_hugging_face(tiny_config) -> None:
+    config = replace(tiny_config, num_kv_blocks=4)
+    hf_config = _hf_config(config)
+    reference = HFQwen3ForCausalLM(hf_config).eval()
+    ours = Qwen3ForCausalLM(config).eval()
+    ours.load_state_dict(reference.state_dict(), strict=True)
+    cache = PagedKVCache(config)
+    cache.create_sequence("request")
+    prompt = torch.arange(17).remainder(config.vocab_size)[None, :]
+
+    expected_prompt = reference(prompt).logits
+    actual_prompt = ours.forward_cached(
+        prompt, cache=cache, sequence_ids=["request"]
+    ).logits
+    torch.testing.assert_close(
+        actual_prompt, expected_prompt, rtol=CPU_RTOL, atol=CPU_ATOL
+    )
+
+    next_input = torch.tensor([[7]])
+    full_input = torch.cat((prompt, next_input), dim=1)
+    expected_decode = reference(full_input).logits[:, -1]
+    actual_decode = ours.forward_cached(
+        next_input, cache=cache, sequence_ids=["request"]
+    ).logits[:, -1]
+    torch.testing.assert_close(
+        actual_decode, expected_decode, rtol=CPU_RTOL, atol=CPU_ATOL
+    )
+
+    cache.release_sequence("request")
+    cache.assert_no_leaks()
+
+
 def test_layer_diagnostic_returns_first_failure() -> None:
     reference = (torch.zeros(2), torch.zeros(2), torch.zeros(2))
     candidate = (torch.zeros(2), torch.ones(2), torch.full((2,), 2.0))
@@ -155,4 +190,3 @@ def test_layer_diagnostic_returns_first_failure() -> None:
     assert difference is not None
     assert difference.index == 1
     assert difference.max_absolute_error == 1.0
-

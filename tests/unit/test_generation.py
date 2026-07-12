@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import torch
+from dataclasses import replace
 
-from engine.generation import greedy_decode
+from engine.cache import PagedKVCache
+from engine.generation import greedy_decode, paged_greedy_decode
 from engine.model.qwen3 import Qwen3ForCausalLM
 
 
@@ -32,3 +34,21 @@ def test_greedy_decode_stops_after_eos(tiny_config) -> None:
     assert actual.shape[1] == input_ids.shape[1] + 1
     assert int(actual[0, -1]) == eos_token_id
 
+
+def test_paged_greedy_decode_matches_dense_and_releases_cache(tiny_config) -> None:
+    config = replace(tiny_config, num_kv_blocks=8)
+    model = Qwen3ForCausalLM(config).eval()
+    cache = PagedKVCache(config)
+    input_ids = torch.arange(17).remainder(config.vocab_size)[None, :]
+
+    expected = greedy_decode(model, input_ids, max_new_tokens=4)
+    actual = paged_greedy_decode(
+        model,
+        input_ids,
+        cache=cache,
+        max_new_tokens=4,
+        sequence_ids=["request"],
+    )
+
+    torch.testing.assert_close(actual, expected, rtol=0.0, atol=0.0)
+    cache.assert_no_leaks()

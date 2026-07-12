@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from typing import Sequence
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 
+from engine.cache import AppendReservation, PagedKVCache, SequenceId, paged_attention
 from engine.config import EngineConfig
 
 
@@ -131,9 +133,54 @@ class Qwen3Attention(nn.Module):
         position_ids: torch.Tensor,
         attention_mask: torch.Tensor,
     ) -> torch.Tensor:
+        query, key, value = self._project_qkv(hidden_states, position_ids)
+
+        key = repeat_kv(key, self.config.query_heads_per_kv_head)
+        value = repeat_kv(value, self.config.query_heads_per_kv_head)
+
+        scores = torch.matmul(query, key.transpose(-2, -1)) * self.scaling
+        scores = scores + attention_mask
+        # FP32 softmax keeps masked, low-probability values stable in FP16.
+        probabilities = F.softmax(scores, dim=-1, dtype=torch.float32).to(query.dtype)
+        attended = torch.matmul(probabilities, value)
+
+        return self._project_output(attended)
+
+    def forward_cached(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        position_ids: torch.Tensor,
+        cache: PagedKVCache,
+        reservation: AppendReservation,
+        layer_index: int,
+    ) -> torch.Tensor:
+        """Append K/V, gather through block tables, and attend to cached context."""
+
+        query, key, value = self._project_qkv(hidden_states, position_ids)
+        cache.write(layer_index, reservation, key, value)
+        layer_cache = cache.layers[layer_index]
+        attended = paged_attention(
+            query,
+            key_blocks=layer_cache.key,
+            value_blocks=layer_cache.value,
+            block_tables=reservation.block_tables,
+            context_lengths=reservation.context_lengths,
+            query_start_positions=reservation.query_start_positions,
+            block_size=self.config.kv_block_size,
+            query_heads_per_kv_head=self.config.query_heads_per_kv_head,
+            scaling=self.scaling,
+        )
+        return self._project_output(attended)
+
+    def _project_qkv(
+        self,
+        hidden_states: torch.Tensor,
+        position_ids: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         batch, sequence, _ = hidden_states.shape
 
-        # Normalize after projection so each head gets its own 128-value RMS.
+        # Normalize after projection so each head gets its own head_dim-value RMS.
         query = self.q_proj(hidden_states).view(
             batch, sequence, self.config.num_attention_heads, self.config.head_dim
         )
@@ -149,16 +196,10 @@ class Qwen3Attention(nn.Module):
 
         cosine, sine = self.rotary(position_ids, dtype=query.dtype)
         query, key = apply_rotary_embedding(query, key, cosine, sine)
+        return query, key, value
 
-        key = repeat_kv(key, self.config.query_heads_per_kv_head)
-        value = repeat_kv(value, self.config.query_heads_per_kv_head)
-
-        scores = torch.matmul(query, key.transpose(-2, -1)) * self.scaling
-        scores = scores + attention_mask
-        # FP32 softmax keeps masked, low-probability values stable in FP16.
-        probabilities = F.softmax(scores, dim=-1, dtype=torch.float32).to(query.dtype)
-        attended = torch.matmul(probabilities, value)
-
+    def _project_output(self, attended: torch.Tensor) -> torch.Tensor:
+        batch, _, sequence, _ = attended.shape
         # Head order must be restored before the output projection.
         attended = attended.transpose(1, 2).contiguous()
         attended = attended.view(batch, sequence, self.config.query_projection_size)
@@ -200,6 +241,31 @@ class Qwen3DecoderLayer(nn.Module):
             hidden_states,
             position_ids=position_ids,
             attention_mask=attention_mask,
+        )
+        hidden_states = residual + hidden_states
+
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        return residual + hidden_states
+
+    def forward_cached(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        position_ids: torch.Tensor,
+        cache: PagedKVCache,
+        reservation: AppendReservation,
+        layer_index: int,
+    ) -> torch.Tensor:
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states = self.self_attn.forward_cached(
+            hidden_states,
+            position_ids=position_ids,
+            cache=cache,
+            reservation=reservation,
+            layer_index=layer_index,
         )
         hidden_states = residual + hidden_states
 
@@ -266,6 +332,40 @@ class Qwen3Model(nn.Module):
             captured.append(hidden_states)
         return hidden_states, tuple(captured) if captured is not None else None
 
+    def forward_cached(
+        self,
+        input_ids: torch.Tensor,
+        *,
+        position_ids: torch.Tensor,
+        cache: PagedKVCache,
+        reservation: AppendReservation,
+        output_hidden_states: bool = False,
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, ...] | None]:
+        """Run the explicit paged path for a uniform-length append batch."""
+
+        if input_ids.ndim != 2:
+            raise ValueError("input_ids must have shape [batch, sequence]")
+        if input_ids.shape != position_ids.shape:
+            raise ValueError("position_ids must match input_ids shape")
+
+        hidden_states = self.embed_tokens(input_ids)
+        captured: list[torch.Tensor] | None = [] if output_hidden_states else None
+        for layer_index, layer in enumerate(self.layers):
+            if captured is not None:
+                captured.append(hidden_states)
+            hidden_states = layer.forward_cached(
+                hidden_states,
+                position_ids=position_ids,
+                cache=cache,
+                reservation=reservation,
+                layer_index=layer_index,
+            )
+
+        hidden_states = self.norm(hidden_states)
+        if captured is not None:
+            captured.append(hidden_states)
+        return hidden_states, tuple(captured) if captured is not None else None
+
     @staticmethod
     def _build_causal_mask(
         input_ids: torch.Tensor,
@@ -322,6 +422,43 @@ class Qwen3ForCausalLM(nn.Module):
         logits = self.lm_head(hidden_states)
         return Qwen3Output(logits=logits, hidden_states=captured)
 
+    def forward_cached(
+        self,
+        input_ids: torch.Tensor,
+        *,
+        cache: PagedKVCache,
+        sequence_ids: Sequence[SequenceId],
+        output_hidden_states: bool = False,
+    ) -> Qwen3Output:
+        """Run a transactional paged-cache append without branching dense forward."""
+
+        if input_ids.ndim != 2:
+            raise ValueError("input_ids must have shape [batch, sequence]")
+        if len(sequence_ids) != input_ids.shape[0]:
+            raise ValueError("sequence_ids must contain one ID per input row")
+        if cache.config != self.config:
+            raise ValueError("cache and model must use the same EngineConfig")
+
+        reservation = cache.begin_append(sequence_ids, input_ids.shape[1])
+        position_ids = reservation.query_start_positions[:, None] + torch.arange(
+            input_ids.shape[1], device=input_ids.device
+        )[None, :]
+        try:
+            hidden_states, captured = self.model.forward_cached(
+                input_ids,
+                position_ids=position_ids,
+                cache=cache,
+                reservation=reservation,
+                output_hidden_states=output_hidden_states,
+            )
+            logits = self.lm_head(hidden_states)
+            cache.commit(reservation)
+        except Exception:
+            if reservation.state == "open":
+                cache.rollback(reservation)
+            raise
+        return Qwen3Output(logits=logits, hidden_states=captured)
+
 
 @dataclass(frozen=True)
 class HiddenStateDifference:
@@ -347,4 +484,3 @@ def first_hidden_state_difference(
             max_error = (expected - actual).abs().max().item()
             return HiddenStateDifference(index=index, max_absolute_error=max_error)
     return None
-
