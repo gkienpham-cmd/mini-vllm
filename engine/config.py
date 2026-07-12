@@ -43,6 +43,7 @@ class EngineConfig:
     dtype: str = "float32"
     kv_block_size: int = 16
     num_kv_blocks: int = 0
+    max_num_batched_tokens: int = 0
 
     # This signature is centralized here; model modules never duplicate it.
     CANONICAL_QWEN3_06B: ClassVar[Mapping[str, Any]] = {
@@ -88,6 +89,8 @@ class EngineConfig:
             raise ValueError("Milestone 2 requires a KV block size of 16 tokens")
         if self.num_kv_blocks < 0:
             raise ValueError("num_kv_blocks must be non-negative")
+        if self.max_num_batched_tokens < 0:
+            raise ValueError("max_num_batched_tokens must be non-negative")
 
     @property
     def torch_dtype(self) -> torch.dtype:
@@ -116,6 +119,7 @@ class EngineConfig:
         dtype: str = "float32",
         kv_block_size: int = 16,
         num_kv_blocks: int = 0,
+        max_num_batched_tokens: int = 0,
         require_canonical: bool = True,
     ) -> "EngineConfig":
         with Path(config_path).open(encoding="utf-8") as config_file:
@@ -128,6 +132,7 @@ class EngineConfig:
             dtype=dtype,
             kv_block_size=kv_block_size,
             num_kv_blocks=num_kv_blocks,
+            max_num_batched_tokens=max_num_batched_tokens,
             require_canonical=require_canonical,
         )
 
@@ -142,6 +147,7 @@ class EngineConfig:
         dtype: str = "float32",
         kv_block_size: int = 16,
         num_kv_blocks: int = 0,
+        max_num_batched_tokens: int = 0,
         require_canonical: bool = True,
     ) -> "EngineConfig":
         if require_canonical:
@@ -200,4 +206,5 @@ class EngineConfig:
             dtype=dtype,
             kv_block_size=kv_block_size,
             num_kv_blocks=num_kv_blocks,
+            max_num_batched_tokens=max_num_batched_tokens,
         )

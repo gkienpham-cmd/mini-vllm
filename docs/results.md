@@ -85,3 +85,52 @@ No throughput, latency, or memory-performance claim is published for this
 milestone. The 28 MiB figure is exact allocated tensor capacity, not measured
 peak process memory. Comparable concurrency, TTFT, p50/p99, throughput, and
 peak-memory measurements remain deferred to the versioned Milestone 5 harness.
+
+## Milestone 3 CPU FP32 scheduler correctness — 2026-07-13
+
+**What changed:** Added a decode-first continuous batching scheduler with a hard
+per-step token budget, chunked prompt/recompute prefill, original-arrival FIFO
+admission, immediate mid-batch retirement, and recompute preemption under KV
+pressure.
+
+**Environment and scheduler conditions:**
+
+- Same Apple M1 Pro CPU, Python 3.12.4, PyTorch 2.13.0, Transformers 4.57.6,
+  deterministic seed 123, and CPU FP32 policy recorded for prior milestones.
+- Block size 16; greedy selection only. Every model input token, including
+  prompt and recompute tokens, counts against `max_num_batched_tokens`.
+- The versioned `python -m bench.scheduler_correctness` harness records every
+  step's scheduled-token count, admissions, emissions, preemptions, request
+  states, and free-block count. It records no wall-clock measurements.
+
+| Correctness scenario | Continuous admission | Recompute saturation |
+| --- | --- | --- |
+| Prompt lengths | Long 3; short 1 | Old 16; new 16 |
+| Output-token limits | Long 6; short 1 | Old 20; new 4 |
+| Physical blocks / token budget | 6 / 4 | 3 / 2 |
+| Maximum scheduled tokens in one step | 3 of 4 | 2 of 2 |
+| Preemption | None | New request once |
+| Completion evidence | Short step 2; long step 6 | Old step 27; new step 37 |
+| Original FIFO age preserved | Pass | Pass: old then new |
+| Dense greedy token equality | Pass for both requests | Pass for both requests |
+| Final cache state | Pass: no live sequences or blocks | Pass: no live sequences or blocks |
+
+Additional verification:
+
+| Correctness check | Result |
+| --- | --- |
+| Chunked prompt and recompute budget enforcement | Pass: no trace exceeded its configured token budget |
+| Repeated arrivals | Pass: the oldest request advanced on every decode iteration and finished |
+| Mid-batch admission and retirement | Pass: the short request joined and retired while the long request remained active |
+| Prefill failure cleanup | Pass: request marked failed and all blocks released |
+| Batched-decode failure cleanup | Pass: affected requests marked failed, unrelated state preserved, and failure diagnostics propagated |
+| Five-prompt scheduler token parity | Pass: every generated token position matched Hugging Face exactly |
+| Full command: `python -m pytest -q` | 37 passed, 1 CUDA test skipped |
+| Portable command: `python -m pytest -q -m "not cuda and not benchmark"` | 37 passed, 1 deselected |
+| Parity command: `python -m pytest -q tests/parity` | 8 passed, 1 CUDA test skipped |
+| T4 FP16 scheduler parity | Not run: no CUDA device on this machine |
+
+This is correctness and scheduling-policy evidence, not a performance result.
+No throughput, TTFT, latency percentile, or peak-memory claim is published;
+equivalent Transformers and mini-vllm measurements remain deferred to the
+versioned Milestone 5 benchmark harness.

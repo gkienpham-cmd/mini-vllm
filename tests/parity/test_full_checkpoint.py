@@ -12,6 +12,7 @@ from engine.config import CANONICAL_MODEL_ID, CANONICAL_MODEL_REVISION
 from engine.generation import greedy_decode, paged_greedy_decode
 from engine.model.loader import load_model, resolve_checkpoint
 from engine.model.qwen3 import first_hidden_state_difference
+from engine.scheduler import ContinuousBatchScheduler
 
 MAX_NEW_TOKENS = 8
 
@@ -103,6 +104,7 @@ def _run_full_parity(device: torch.device, dtype: torch.dtype) -> None:
         device=str(device),
         dtype=mini_dtype,
         num_kv_blocks=8,
+        max_num_batched_tokens=16,
     )
     assert report.consumed
     assert model.model.embed_tokens.weight.data_ptr() == model.lm_head.weight.data_ptr()
@@ -130,10 +132,37 @@ def _run_full_parity(device: torch.device, dtype: torch.dtype) -> None:
     ]
     cache.assert_no_leaks()
 
-    for fixture, expected, dense, cached in zip(
-        PROMPTS, expected_tokens, actual_tokens, cached_tokens, strict=True
+    scheduler_cache = PagedKVCache(model.config)
+    scheduled_tokens = []
+    for fixture, input_ids in zip(PROMPTS, tokenized, strict=True):
+        scheduler = ContinuousBatchScheduler(model, scheduler_cache)
+        scheduler.submit(
+            fixture.category,
+            input_ids[0],
+            max_new_tokens=MAX_NEW_TOKENS,
+            eos_token_id=tokenizer.eos_token_id,
+        )
+        while scheduler.has_unfinished_requests:
+            scheduler.step()
+        generated = torch.tensor(
+            [scheduler.get_request(fixture.category).generated_token_ids],
+            dtype=input_ids.dtype,
+            device=input_ids.device,
+        )
+        scheduled_tokens.append(torch.cat((input_ids, generated), dim=1).cpu())
+    scheduler_cache.assert_no_leaks()
+
+    for fixture, expected, dense, cached, scheduled in zip(
+        PROMPTS,
+        expected_tokens,
+        actual_tokens,
+        cached_tokens,
+        scheduled_tokens,
+        strict=True,
     ):
-        assert expected.shape == dense.shape == cached.shape, fixture.category
+        assert expected.shape == dense.shape == cached.shape == scheduled.shape, (
+            fixture.category
+        )
         # Comparing every column makes the first divergent decode step visible.
         for step in range(expected.shape[1]):
             torch.testing.assert_close(
@@ -149,6 +178,13 @@ def _run_full_parity(device: torch.device, dtype: torch.dtype) -> None:
                 rtol=0.0,
                 atol=0.0,
                 msg=f"paged {fixture.category} diverged at token column {step}",
+            )
+            torch.testing.assert_close(
+                scheduled[:, step],
+                expected[:, step],
+                rtol=0.0,
+                atol=0.0,
+                msg=f"scheduler {fixture.category} diverged at token column {step}",
             )
 
     actual_output = model(tokenized[0], output_hidden_states=True)

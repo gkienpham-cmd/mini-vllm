@@ -18,6 +18,7 @@ def test_checkpoint_values_flow_into_one_config() -> None:
     assert config.query_heads_per_kv_head == 2
     assert config.kv_block_size == 16
     assert config.num_kv_blocks == 0
+    assert config.max_num_batched_tokens == 0
 
 
 def test_canonical_validation_rejects_silent_architecture_drift() -> None:
@@ -45,4 +46,9 @@ def test_cache_runtime_choices_are_validated(tiny_config: EngineConfig) -> None:
     values = dict(tiny_config.__dict__)
     values["num_kv_blocks"] = -1
     with pytest.raises(ValueError, match="non-negative"):
+        EngineConfig(**values)
+
+    values = dict(tiny_config.__dict__)
+    values["max_num_batched_tokens"] = -1
+    with pytest.raises(ValueError, match="max_num_batched_tokens"):
         EngineConfig(**values)

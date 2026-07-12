@@ -152,6 +152,42 @@ class PagedKVCache:
         except KeyError as error:
             raise KeyError(f"unknown sequence {sequence_id!r}") from error
 
+    def has_sequence(self, sequence_id: SequenceId) -> bool:
+        """Return whether logical cache state exists for a sequence."""
+
+        return sequence_id in self._sequences
+
+    @property
+    def free_block_count(self) -> int:
+        return self.allocator.free_count
+
+    def required_blocks_for_append(
+        self,
+        sequence_id: SequenceId,
+        query_length: int,
+    ) -> int:
+        """Return the additional physical blocks needed for one append."""
+
+        if query_length <= 0:
+            raise ValueError("query_length must be positive")
+        state = self.sequence_state(sequence_id)
+        end_length = state.num_tokens + query_length
+        if end_length > self.config.max_position_embeddings:
+            raise ValueError("cache append exceeds the configured context length")
+        return math.ceil(end_length / self.config.kv_block_size) - len(
+            state.block_ids
+        )
+
+    def append_capacity(self, sequence_id: SequenceId) -> int:
+        """Return tokens appendable using this sequence's tail and all free blocks."""
+
+        state = self.sequence_state(sequence_id)
+        allocated_slots = len(state.block_ids) * self.config.kv_block_size
+        unused_tail_slots = allocated_slots - state.num_tokens
+        free_block_slots = self.free_block_count * self.config.kv_block_size
+        context_slots = self.config.max_position_embeddings - state.num_tokens
+        return min(unused_tail_slots + free_block_slots, context_slots)
+
     def begin_append(
         self,
         sequence_ids: Sequence[SequenceId],
@@ -174,8 +210,8 @@ class PagedKVCache:
             raise ValueError("cache append exceeds the configured context length")
 
         required_counts = tuple(
-            math.ceil(end / self.config.kv_block_size) - len(state.block_ids)
-            for state, end in zip(states, end_lengths, strict=True)
+            self.required_blocks_for_append(sequence_id, query_length)
+            for sequence_id in ids
         )
         allocated = self.allocator.allocate_many(sum(required_counts))
         new_blocks: list[tuple[int, ...]] = []

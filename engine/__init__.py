@@ -5,6 +5,15 @@ from engine.config import EngineConfig
 from engine.generation import greedy_decode, paged_greedy_decode
 from engine.model.loader import WeightLoadReport, load_model, load_safetensors
 from engine.model.qwen3 import Qwen3ForCausalLM, Qwen3Output
+from engine.scheduler import (
+    ContinuousBatchScheduler,
+    FinishReason,
+    RequestOutput,
+    RequestStatus,
+    SchedulerExecutionError,
+    SchedulerRequest,
+    SchedulerStep,
+)
 
 __all__ = [
     "EngineConfig",
@@ -18,4 +27,11 @@ __all__ = [
     "paged_greedy_decode",
     "load_model",
     "load_safetensors",
+    "ContinuousBatchScheduler",
+    "FinishReason",
+    "RequestOutput",
+    "RequestStatus",
+    "SchedulerExecutionError",
+    "SchedulerRequest",
+    "SchedulerStep",
 ]

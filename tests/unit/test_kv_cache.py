@@ -74,6 +74,24 @@ def test_sequence_tables_are_independent_and_partial_blocks_are_reused(
     cache.assert_no_leaks()
 
 
+def test_cache_reports_append_block_requirements_and_capacity(tiny_config) -> None:
+    config = replace(tiny_config, num_kv_blocks=3)
+    cache = PagedKVCache(config)
+    cache.create_sequence("request")
+
+    assert cache.required_blocks_for_append("request", 1) == 1
+    assert cache.append_capacity("request") == 48
+    reservation = cache.begin_append(["request"], query_length=15)
+    cache.commit(reservation)
+
+    assert cache.required_blocks_for_append("request", 1) == 0
+    assert cache.required_blocks_for_append("request", 2) == 1
+    assert cache.append_capacity("request") == 33
+
+    cache.release_sequence("request")
+    cache.assert_no_leaks()
+
+
 def test_append_rollback_is_atomic_across_sequences(tiny_config) -> None:
     config = replace(tiny_config, num_kv_blocks=4)
     cache = PagedKVCache(config)

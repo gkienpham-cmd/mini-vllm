@@ -376,3 +376,123 @@ failure invalidates the bound. CUDA FP16 keeps its existing independent
 **Interview soundbite:** I isolated a measured GEMM-shape effect instead of
 weakening the oracle: HF stayed at `1e-5/1e-6`, while the local cached comparison
 used `1e-5/2e-6` and preserved exact greedy tokens.
+
+## [Milestone 3] Recompute preempted requests from retained token IDs
+
+**Date:** 2026-07-13
+
+**Context:** A running sequence can reach a new-block boundary when every
+physical KV block is occupied. The scheduler must free capacity without losing
+the request's generated result or leaving partial cache state behind.
+
+**Options considered:**
+
+1. **Recompute:** Release the victim's KV blocks, retain its token IDs, and
+   rebuild the prefix when rescheduled; this frees device memory immediately but
+   repeats model work.
+2. **CPU swap:** Preserve completed KV state in host memory, avoiding recompute
+   but adding host capacity, transfer latency, and restore bookkeeping.
+3. **Admission only:** Never evict resident work, which is simplest but cannot
+   recover capacity among active requests at competing block boundaries.
+
+**Decision:** Preempt the newest lower-priority resident request, release all of
+its blocks, retain its prompt and generated token IDs, and rebuild its cache in
+budgeted chunks when FIFO order selects it again.
+
+**Why:** Recompute keeps the first scheduler implementation independent of host
+memory and PCIe behavior. Token IDs are much smaller than per-layer K/V state,
+and transactional cache appends make release and rebuild unambiguous. The cost
+is explicit repeated compute rather than hidden swap traffic.
+
+**Measured result:** [Milestone 3 CPU FP32 scheduler correctness](results.md#milestone-3-cpu-fp32-scheduler-correctness-2026-07-13)
+— a three-block saturation trace preempted only the newer request, rebuilt it,
+matched dense greedy tokens for both requests, completed in original FIFO order,
+and ended leak-free.
+
+**What would change this:** At 10x model size, long-prefix recompute may dominate
+resume latency and justify measured CPU swap or prefix reuse. At 100x traffic,
+victim-selection cost and device-level sharding need profiling. A CUDA attention
+backend changes recompute speed but not scheduler ownership or retained state.
+
+**Interview soundbite:** Under three-block saturation I evicted the newer
+request once, rebuilt it from token IDs, preserved FIFO completion, and matched
+both dense outputs without leaking a block.
+
+## [Milestone 3] Preserve original arrival order across preemption
+
+**Date:** 2026-07-13
+
+**Context:** New arrivals and recomputed requests compete for limited compute and
+KV capacity. A teaching scheduler needs a policy whose progress and starvation
+behavior can be explained from its state alone.
+
+**Options considered:**
+
+1. **Original-arrival FIFO:** Retain the first arrival index through preemption;
+   deterministic and starvation-free for finite requests, but not optimized for
+   shortest-job latency.
+2. **Shortest remaining work:** Improves small-request completion in favorable
+   workloads but can indefinitely postpone long requests.
+3. **Aging priority:** Balances short-job preference with eventual progress but
+   adds a tunable priority formula and more state.
+
+**Decision:** Order waiting, partial-prefill, and preempted requests by one
+immutable arrival index. Only older work may reclaim blocks from younger
+residents.
+
+**Why:** Finite token limits let FIFO give a direct progress argument: later
+arrivals cannot overtake or evict older requests. Continuous batching still lets
+a short admitted request finish before a long active request because both make
+iteration-level progress.
+
+**Measured result:** [Milestone 3 CPU FP32 scheduler correctness](results.md#milestone-3-cpu-fp32-scheduler-correctness-2026-07-13)
+— the short request joined on step 2 and finished while the long request ran
+until step 6; under saturation, the older request completed before the
+preempted newer request.
+
+**What would change this:** At 100x traffic, service tiers or deadline-aware
+aging may be needed, but starvation checks must remain explicit. Model scale and
+attention backend choice do not change the ordering contract.
+
+**Interview soundbite:** Immutable FIFO age made starvation testable: a short
+request joined and finished on step 2 while the long request kept decoding, and
+preemption never let newer work overtake older work.
+
+## [Milestone 3] Decode first and chunk prefill under a hard token budget
+
+**Date:** 2026-07-13
+
+**Context:** Each scheduler iteration must bound model work while supporting
+prompts longer than that bound and keeping already-running token streams moving.
+
+**Options considered:**
+
+1. **Decode-first exact chunking:** Give every running request one decode token,
+   then use the remaining budget for prompt or recompute chunks.
+2. **Prefill-first exact chunking:** Improves new-request time to first token but
+   can create inter-token stalls for active requests under sustained arrivals.
+3. **Unchunked prefill:** Reject or overflow prompts larger than the iteration
+   budget, simplifying state at the cost of a weaker interface or budget.
+
+**Decision:** Count every forward input token against
+`max_num_batched_tokens`, batch one-token decodes first, and process FIFO prefill
+or recompute work in chunks that never exceed the remaining budget.
+
+**Why:** Decode-first ordering stabilizes active progress. Exact chunking keeps
+the configured budget a hard invariant rather than a target and reuses the
+paged cache's absolute positions across arbitrary prompt boundaries.
+
+**Measured result:** [Milestone 3 CPU FP32 scheduler correctness](results.md#milestone-3-cpu-fp32-scheduler-correctness-2026-07-13)
+— raw traces never exceeded their budgets: the admission case scheduled at
+most 3 of 4 tokens and the saturated recompute case reached exactly 2 of 2.
+Both scenarios matched dense greedy output, and all five canonical scheduler
+prompts matched Hugging Face token-for-token.
+
+**What would change this:** At 100x traffic, measured TTFT versus inter-token
+latency may justify reserving a configurable prefill share or batching compatible
+chunks. A custom CUDA backend may alter the best chunk size but not the hard
+budget accounting.
+
+**Interview soundbite:** Every forward token was charged to the step budget:
+the traces peaked at 3/4 and 2/2 tokens, while chunked prompts and recompute still
+matched the dense and Hugging Face outputs exactly.
